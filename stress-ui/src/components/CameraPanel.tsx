@@ -65,6 +65,24 @@ const CameraPanel: React.FC<Props> = ({ onAnalyze }) => {
     }
   };
 
+  const switchCamera = async (idx: number) => {
+    setCamIndex(idx);
+    setError(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ index: idx }),
+      });
+      const js = await res.json();
+      if (!res.ok) throw new Error(js?.error || `Failed to switch to camera ${idx}`);
+      setRunning(true);
+      connectSSE();
+    } catch (e: any) {
+      setError(e?.message || `Failed to switch to camera ${idx}`);
+    }
+  };
+
   const stopBackend = async () => {
     try {
       await fetch(`${API_BASE}/api/stop`, { method: 'POST' });
@@ -105,6 +123,8 @@ const CameraPanel: React.FC<Props> = ({ onAnalyze }) => {
             inputProps={{ min: 0, step: 1 }}
             sx={{ width: 160 }}
           />
+          <Button variant="outlined" size="small" onClick={() => switchCamera(0)}>Laptop Cam</Button>
+          <Button variant="outlined" size="small" onClick={() => switchCamera(1)}>USB Cam</Button>
           <Typography variant="body2" color="text.secondary">
             Tip: 0 = default webcam. Increase for external cameras.
           </Typography>

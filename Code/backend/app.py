@@ -10,6 +10,12 @@ import numpy as np
 from flask import Flask, Response, request, jsonify
 from flask_cors import CORS
 
+# Optional serial (pyserial) for real-time code output
+try:
+    import serial  # pyserial
+except Exception as e:
+    serial = None
+
 # Deep/dlib pipeline (loaded lazily, once)
 _dlib_ready = False
 _dlib_error = None
@@ -37,10 +43,30 @@ frame_lock = threading.Lock()
 cap = None
 running = False
 cam_index = 0
+cam_thread = None
 
 # Shared latest summary and frame
 latest_summary = {"level": 0.0, "label": "Low", "faces": 0}
+latest_level = "Low"          # textual stress level for quick access (Low|Moderate|High)
 latest_frame = None  # BGR frame updated by camera worker
+
+# Serial output state
+SERIAL_PORT = os.environ.get('SERIAL_PORT', 'COM3')
+SERIAL_BAUD = int(os.environ.get('SERIAL_BAUD', '9600'))
+SERIAL_ENABLED = os.environ.get('SERIAL_ENABLED', '0').lower() in ('1', 'true', 'yes', 'on')
+_serial_handle = None
+_last_sent_code = None
+
+# Pause/auto-cycle control (do NOT stop backend, only freeze updates)
+paused = False                 # when True, camera reading and updates are frozen
+capturing = False              # when True, we are in a 5s pre-freeze capture window
+auto_cycle = True              # automatically pause when a face is detected
+CAPTURE_SECONDS = 5.0          # time to capture before freezing to get correct value
+PAUSE_SECONDS = 10.0           # duration to keep the snapshot frozen
+capture_until = 0.0            # epoch timestamp when we should freeze and pause
+pause_until = 0.0              # epoch timestamp when we should auto-resume
+last_resume_ts = 0.0           # last time we resumed (for cooldown)
+RESUME_COOLDOWN = 1.0          # seconds after resume before we allow next auto-pause
 
 # dlib / model objects
 _detector = None
@@ -63,7 +89,18 @@ _HISTORY_MAX_PER_FEATURE = 300
 
 # Exponential moving average for smoothing the final stress level
 _ema_level = None
-_EMA_ALPHA = 0.3  # higher = more reactive, lower = smoother
+_EMA_ALPHA = 0.15  # lower = smoother, reduced volatility
+
+# Discrete label hysteresis state
+_last_discrete_label = "Low"
+_HYST_HIGH_ENTER = 0.80
+_HYST_HIGH_EXIT = 0.70
+_HYST_MOD_ENTER = 0.40
+_HYST_MOD_EXIT = 0.30
+
+# Per-feature EMA smoothing
+_feature_emas = {}
+_FE_EMA_ALPHA = 0.3
 
 # Throttling for emotion model to improve efficiency
 _frame_count = 0
@@ -71,11 +108,22 @@ _last_emotion_label = "unknown"
 
 
 def level_to_label(level: float) -> str:
-    if level >= 0.75:
-        return "High"
-    if level >= 0.35:
-        return "Moderate"
-    return "Low"
+    global _last_discrete_label
+    # Hysteresis to avoid rapid flips between classes
+    if _last_discrete_label == "High":
+        if level < _HYST_HIGH_EXIT:
+            _last_discrete_label = "Moderate" if level >= _HYST_MOD_EXIT else "Low"
+    elif _last_discrete_label == "Moderate":
+        if level >= _HYST_HIGH_ENTER:
+            _last_discrete_label = "High"
+        elif level < _HYST_MOD_EXIT:
+            _last_discrete_label = "Low"
+    else:  # Low
+        if level >= _HYST_HIGH_ENTER:
+            _last_discrete_label = "High"
+        elif level >= _HYST_MOD_ENTER:
+            _last_discrete_label = "Moderate"
+    return _last_discrete_label
 
 
 def _ensure_models_loaded():
@@ -140,28 +188,45 @@ def _euclidean(p1: Tuple[int, int], p2: Tuple[int, int]) -> float:
 
 def _normalize_points(value: float, feature_key: str = "default") -> Tuple[float, str]:
     """
-    Normalize a feature's value within its own rolling history, mapping changes to [0..1] stress.
-    Larger deviation from recent range => higher stress. Returns (level, label).
+    Normalize a feature value within its rolling history and smooth it with EMA.
+    Returns (smoothed_level in [0..1], hysteretic label) to reduce volatility.
     """
-    global _feature_histories
+    global _feature_histories, _feature_emas
     history = _feature_histories.get(feature_key, [])
     history.append(float(value))
     if len(history) > _HISTORY_MAX_PER_FEATURE:
         history = history[-_HISTORY_MAX_PER_FEATURE:]
     _feature_histories[feature_key] = history
 
-    if len(history) < 5 or np.max(history) == np.min(history):
-        return 0.5, "initializing"
+    # Require a small warmup window for stability
+    if len(history) < 8 or np.max(history) == np.min(history):
+        # Initialize EMA with neutral level to avoid spikes
+        init_level = 0.5
+        prev = _feature_emas.get(feature_key)
+        if prev is None:
+            _feature_emas[feature_key] = init_level
+        return init_level, "initializing"
 
     vmin, vmax = float(np.min(history)), float(np.max(history))
     normalized_value = abs(value - vmin) / max(abs(vmax - vmin), 1e-6)
-    # Use a soft mapping; clamp to [0..1]
+
+    # Soft non-linear mapping and clamp to [0..1]
     stress_value = float(np.tanh(normalized_value))
     stress_value = max(0.0, min(1.0, stress_value))
+
     if np.isnan(stress_value):
         return 0.5, "calculating"
-    label = "High" if stress_value >= 0.75 else ("Moderate" if stress_value >= 0.35 else "Low")
-    return stress_value, label
+
+    # Per-feature EMA smoothing
+    prev = _feature_emas.get(feature_key)
+    if prev is None:
+        smoothed = stress_value
+    else:
+        smoothed = float(_FE_EMA_ALPHA * stress_value + (1.0 - _FE_EMA_ALPHA) * prev)
+    _feature_emas[feature_key] = smoothed
+
+    label = "High" if smoothed >= 0.75 else ("Moderate" if smoothed >= 0.35 else "Low")
+    return smoothed, label
 
 
 # Accurate pipeline using dlib landmarks + mini_XCEPTION emotion model
@@ -232,6 +297,17 @@ def _accurate_from_dlib(frame_bgr):
     eye_metric = max(0.0, min(1.0, 1.0 - float(min(ear_l, ear_r))))
     l_eye, _ = _normalize_points(eye_metric, feature_key="eyes")
 
+    # Eyebrow–eye vertical gap (smaller gap => higher tension)
+    try:
+        left_gap = abs(float(np.mean(left_eb[:, 1]) - np.mean(left_eye[:, 1]))) / face_h
+        right_gap = abs(float(np.mean(right_eb[:, 1]) - np.mean(right_eye[:, 1]))) / face_h
+        gap = float((left_gap + right_gap) / 2.0)
+    except Exception:
+        gap = 0.1
+    # Map to [0..1]: smaller gap -> higher metric
+    brow_eye_metric = max(0.0, min(1.0, 1.0 - gap))
+    l_brow_eye, _ = _normalize_points(brow_eye_metric, feature_key="brow_eye_gap")
+
     # Mouth: MAR using outer mouth
     (mBegin, mEnd) = face_utils.FACIAL_LANDMARKS_IDXS["mouth"]
     mouth = shape_np[mBegin:mEnd]
@@ -257,6 +333,21 @@ def _accurate_from_dlib(frame_bgr):
     mouth_metric = max(0.0, min(1.0, float(mar)))
     l_mouth, _ = _normalize_points(mouth_metric, feature_key="mouth")
 
+    # Smile metric: wider mouth with relatively small vertical opening => smile
+    try:
+        p48, p54 = mouth[0], mouth[6]
+        p51, p57 = mouth[3], mouth[9]
+        mouth_width = _euclidean(tuple(p48), tuple(p54))
+        mouth_height = _euclidean(tuple(p51), tuple(p57))
+        smile_ratio = float(mouth_width / max(mouth_height, 1e-6))
+        # Normalize geometry by face dimensions for robustness
+        mouth_width_norm = float(mouth_width / max(face_w, 1e-6))
+        mouth_height_norm = float(mouth_height / max(face_h, 1e-6))
+    except Exception:
+        smile_ratio = 1.0
+        mouth_width_norm = 0.20
+        mouth_height_norm = 0.10
+
     # Chin/Jaw drop: nose-tip to chin distance normalized by face height
     try:
         chin_pt = tuple(shape_np[8])   # index 8
@@ -267,8 +358,14 @@ def _accurate_from_dlib(frame_bgr):
     chin_metric = max(0.0, min(1.0, float(chin_dist)))
     l_chin, _ = _normalize_points(chin_metric, feature_key="chin")
 
-    # Fuse features
-    level_fused = (0.35 * l_eb) + (0.30 * l_eye) + (0.25 * l_mouth) + (0.10 * l_chin)
+    # Fuse features (weights tuned for stability and accuracy)
+    level_fused = (
+        0.30 * l_eb      # inner-brow distance metric
+        + 0.25 * l_brow_eye  # brow-eye vertical gap
+        + 0.25 * l_eye    # eye closure
+        + 0.15 * l_mouth  # mouth opening
+        + 0.05 * l_chin   # jaw drop
+    )
 
     # Emotion via mini_XCEPTION (throttled)
     (x, y, w, h) = _last_face_bb
@@ -293,10 +390,40 @@ def _accurate_from_dlib(frame_bgr):
     except Exception:
         emotion_label = _last_emotion_label
 
-    # Emotion adjustment
-    is_emotion_stressed = emotion_label in ("scared", "sad")
-    if is_emotion_stressed:
-        level_fused = max(level_fused, 0.75)
+    # Emotion + rule-based adjustments to match desired behavior (stronger Low/High)
+    # LOW: smile/calm → stronger and more robust
+    # Conditions: emotion happy OR wide mouth with modest vertical opening
+    is_smile_geom = (smile_ratio >= 1.9 and mouth_width_norm >= 0.28 and mouth_height_norm <= 0.09 and l_mouth <= 0.58)
+    if emotion_label == "happy" or is_smile_geom:
+        level_fused = min(level_fused, 0.18)
+
+    # MODERATE: keep as before for neutral
+    elif emotion_label == "neutral":
+        level_fused = min(max(level_fused, 0.48), 0.62)
+
+    # HIGH: angry with lowered brows and slightly expanded eyes
+    elif emotion_label == "angry":
+        # Brow tension and eye expansion increase confidence (relaxed gates)
+        strong_brow_tension = max(l_brow_eye, l_eb) >= 0.50
+        eyes_expanded = l_eye <= 0.60  # lower l_eye means more open/expanded
+        if strong_brow_tension and eyes_expanded:
+            level_fused = max(level_fused, 0.92)
+        elif strong_brow_tension or eyes_expanded:
+            level_fused = max(level_fused, 0.86)
+        else:
+            level_fused = max(level_fused, 0.80)
+
+    # HIGH: tense states (scared/sad) but require some brow evidence to avoid false highs
+    elif emotion_label in ("scared", "sad"):
+        if max(l_brow_eye, l_eb) >= 0.52:
+            level_fused = max(level_fused, 0.85)
+        else:
+            level_fused = max(level_fused, 0.75)
+
+    else:
+        # Fallback High: strong brow tension + slightly expanded eyes (relaxed gates)
+        if (l_brow_eye >= 0.60 and l_eb >= 0.56 and l_eye <= 0.62):
+            level_fused = max(level_fused, 0.88)
 
     # EMA smoothing
     global _ema_level
@@ -384,11 +511,22 @@ def draw_overlays(frame_bgr):
 
 
 def camera_worker():
-    global cap, running, latest_summary, latest_frame
+    global cap, running, latest_summary, latest_frame, latest_level, paused, capturing, capture_until, pause_until, last_resume_ts, _serial_handle, _last_sent_code
     while running:
+        now = time.time()
         if cap is None:
             time.sleep(0.05)
             continue
+
+        # If paused, keep streaming frozen frame until auto-resume
+        if paused:
+            if now >= pause_until:
+                paused = False
+                last_resume_ts = now
+            else:
+                time.sleep(0.03)
+                continue
+
         ok, frame = cap.read()
         if not ok:
             time.sleep(0.01)
@@ -399,12 +537,111 @@ def camera_worker():
         if w > 800:
             scale = 800.0 / w
             frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
-        # Update summary first
-        latest_summary = compute_stress_from_frame(frame)
-        # Then draw overlays for display stream
+
+        # Live analysis
+        summary = compute_stress_from_frame(frame)
+        # Update quick-access latest_level
+        try:
+            latest_level = str(summary.get('label', latest_level))
+        except Exception:
+            pass
+
+        # Send serial code on change (or print when serial disabled)
+        try:
+            level_text = latest_level
+            code_map = {"Low": 0, "Moderate": 1, "High": 2}
+            code = code_map.get(level_text, -1)
+            if code != _last_sent_code:
+                if SERIAL_ENABLED and serial is not None:
+                    # lazy-open port
+                    if _serial_handle is None:
+                        _serial_handle = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
+                        time.sleep(0.1)
+                    _serial_handle.write(str(code).encode())
+                else:
+                    print(f"[CODE] {code} ({level_text})")
+                _last_sent_code = code
+        except Exception:
+            # If serial fails, do not break the loop; close handle to retry next time
+            try:
+                if _serial_handle is not None:
+                    _serial_handle.close()
+            except Exception:
+                pass
+            _serial_handle = None
+
+        faces_detected = int(summary.get('faces', 0))
+
+        # If we are in capturing window, keep updating summary for stability until time elapses
+        if capturing:
+            latest_summary = summary
+            try:
+                latest_level = str(summary.get('label', latest_level))
+            except Exception:
+                pass
+            display_live = frame.copy()
+            draw_overlays(display_live)
+            with frame_lock:
+                latest_frame = display_live
+            if now >= capture_until:
+                # End capture window and freeze current annotated snapshot for PAUSE_SECONDS
+                display_snapshot = frame.copy()
+                latest_summary = summary
+                try:
+                    latest_level = str(summary.get('label', latest_level))
+                except Exception:
+                    pass
+                # Also ensure serial reflects the final captured level (or print)
+                try:
+                    level_text = latest_level
+                    code_map = {"Low": 0, "Moderate": 1, "High": 2}
+                    code = code_map.get(level_text, -1)
+                    if code != _last_sent_code:
+                        if SERIAL_ENABLED and serial is not None:
+                            if _serial_handle is None:
+                                _serial_handle = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
+                                time.sleep(0.1)
+                            _serial_handle.write(str(code).encode())
+                        else:
+                            print(f"[CODE] {code} ({level_text}) [freeze]")
+                        _last_sent_code = code
+                except Exception:
+                    try:
+                        if _serial_handle is not None:
+                            _serial_handle.close()
+                    except Exception:
+                        pass
+                    _serial_handle = None
+                draw_overlays(display_snapshot)
+                with frame_lock:
+                    latest_frame = display_snapshot
+                capturing = False
+                paused = True
+                pause_until = now + PAUSE_SECONDS
+            time.sleep(0.03)
+            continue
+
+        # If not capturing and a face is detected, start capture window (after cooldown)
+        if faces_detected > 0 and (now - last_resume_ts) >= RESUME_COOLDOWN:
+            capturing = True
+            capture_until = now + CAPTURE_SECONDS
+            # Immediately show live frame while capturing to provide feedback
+            latest_summary = summary
+            display_live = frame.copy()
+            draw_overlays(display_live)
+            with frame_lock:
+                latest_frame = display_live
+            time.sleep(0.03)
+            continue
+
+        # Normal live streaming when no face / not capturing
+        latest_summary = summary
+        try:
+            latest_level = str(summary.get('label', latest_level))
+        except Exception:
+            pass
         display = frame.copy()
         draw_overlays(display)
-        # Update shared frame (annotated)
         with frame_lock:
             latest_frame = display
         time.sleep(0.03)  # ~30 Hz loop
@@ -412,26 +649,57 @@ def camera_worker():
 
 @app.route('/api/start', methods=['POST'])
 def start_camera():
-    global cap, running, cam_index
+    global cap, running, cam_index, cam_thread, paused, capturing, capture_until, pause_until, last_resume_ts
     data = request.get_json(silent=True) or {}
     idx = int(data.get('index', cam_index))
     with cam_lock:
-        if running:
-            return jsonify({"status": "already_running", "index": cam_index, "dlib_ready": _ensure_models_loaded(), "dlib_error": _dlib_error}), 200
-        cap_local = cv2.VideoCapture(idx)
-        if not cap_local or not cap_local.isOpened():
-            return jsonify({"error": f"Failed to open camera index {idx}"}), 400
-        cap = cap_local
-        cam_index = idx
-        running = True
-        t = threading.Thread(target=camera_worker, daemon=True)
-        t.start()
-    return jsonify({"status": "started", "index": cam_index, "dlib_ready": _ensure_models_loaded(), "dlib_error": _dlib_error}), 200
+        switching = running and (idx != cam_index)
+        if not running or switching:
+            # If switching, stop current capture first and join previous thread
+            if running:
+                running = False
+                try:
+                    if cap is not None:
+                        cap.release()
+                except Exception:
+                    pass
+                cap = None
+                # Give the worker loop a moment to exit
+                time.sleep(0.05)
+                try:
+                    if cam_thread is not None and cam_thread.is_alive():
+                        cam_thread.join(timeout=0.5)
+                except Exception:
+                    pass
+                cam_thread = None
+            # Open requested camera index
+            cap_local = cv2.VideoCapture(idx)
+            if not cap_local or not cap_local.isOpened():
+                return jsonify({"error": f"Failed to open camera index {idx}"}), 400
+            cap = cap_local
+            cam_index = idx
+            running = True
+            # Reset pause/capture state when (re)starting
+            paused = False
+            capturing = False
+            capture_until = 0.0
+            pause_until = 0.0
+            last_resume_ts = time.time()
+            cam_thread = threading.Thread(target=camera_worker, daemon=True)
+            cam_thread.start()
+            return jsonify({"status": "switched" if switching else "started", "index": cam_index, "dlib_ready": _ensure_models_loaded(), "dlib_error": _dlib_error}), 200
+        # Already running and same index: just clear any paused/capturing state
+        paused = False
+        capturing = False
+        capture_until = 0.0
+        pause_until = 0.0
+        last_resume_ts = time.time()
+        return jsonify({"status": "already_running", "index": cam_index, "dlib_ready": _ensure_models_loaded(), "dlib_error": _dlib_error}), 200
 
 
 @app.route('/api/stop', methods=['POST'])
 def stop_camera():
-    global cap, running
+    global cap, running, cam_thread
     with cam_lock:
         running = False
         if cap is not None:
@@ -440,12 +708,31 @@ def stop_camera():
             except Exception:
                 pass
             cap = None
+        # Wait briefly for worker to exit
+        try:
+            if cam_thread is not None and cam_thread.is_alive():
+                cam_thread.join(timeout=0.5)
+        except Exception:
+            pass
+        cam_thread = None
     return jsonify({"status": "stopped"}), 200
 
 
 @app.route('/api/summary', methods=['GET'])
 def get_summary():
     return jsonify(latest_summary), 200
+
+@app.route('/api/stress-code', methods=['GET'])
+def stress_code():
+    # Read most recent textual level
+    try:
+        level_text = str(latest_level)
+    except Exception:
+        level_text = str(latest_summary.get('label', '')) if isinstance(latest_summary, dict) else ''
+    # Map to code
+    code_map = {"Low": 0, "Moderate": 1, "High": 2}
+    code = code_map.get(level_text, -1)
+    return jsonify({"level": level_text, "code": code}), 200
 
 
 @app.route('/api/stream')
