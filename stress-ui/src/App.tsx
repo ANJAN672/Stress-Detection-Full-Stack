@@ -6,10 +6,12 @@ import HistoryIcon from '@mui/icons-material/History';
 import CameraPanel from './components/CameraPanel';
 import StressPanel, { StressSummary } from './components/StressPanel';
 import HistoryPanel, { HistoryItem } from './components/HistoryPanel';
+import ReceiptPopup from './components/ReceiptPopup';
 
 function App() {
   const [summary, setSummary] = useState<StressSummary>({ level: 0.1, label: 'Low', recommendations: ['Initializing...'] });
   const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [showReceipt, setShowReceipt] = useState(false);
 
   // Consume backend summaries
   useEffect(() => {
@@ -34,6 +36,17 @@ function App() {
 
   const resetHistory = () => setHistory([]);
 
+  const handleAnalyze = () => {
+    // Camera froze and analysis point reached → show receipt popup
+    setShowReceipt(true);
+  };
+
+  const handleReceiptClose = (reason: 'print' | 'cancel' | 'auto_cancel') => {
+    setShowReceipt(false);
+    // Unfreeze camera
+    window.dispatchEvent(new Event('ui:unfreeze'));
+  };
+
   return (
     <Container maxWidth="xl" sx={{ py: 3 }}>
       <Paper elevation={0} sx={{ p: 2, mb: 2, borderRadius: 3, border: '1px solid #eee' }}>
@@ -46,7 +59,7 @@ function App() {
 
       <Grid container spacing={2}>
         <Grid item xs={12} md={6}>
-          <CameraPanel onAnalyze={() => {}} />
+          <CameraPanel onAnalyze={handleAnalyze} />
         </Grid>
 
         <Grid item xs={12} md={6}>
@@ -73,6 +86,9 @@ function App() {
         <LinearProgress variant="determinate" value={Math.min(100, summary.level * 100)} sx={{ height: 8, borderRadius: 999 }} />
         <Typography variant="caption" sx={{ display: 'block', mt: 0.5 }}>Live backend analysis ~2 FPS</Typography>
       </Box>
+
+      {/* Receipt Popup */}
+      <ReceiptPopup open={showReceipt} summary={summary} onClose={handleReceiptClose} />
     </Container>
   );
 }

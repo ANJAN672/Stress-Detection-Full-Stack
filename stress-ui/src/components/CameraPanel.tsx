@@ -17,6 +17,13 @@ const CameraPanel: React.FC<Props> = ({ onAnalyze }) => {
   const [camIndex, setCamIndex] = useState<number>(0);
   const esRef = useRef<EventSource | null>(null);
 
+  // Freeze flow state
+  const [isFreezing, setIsFreezing] = useState(false);
+  const [freezeCountdown, setFreezeCountdown] = useState(5);
+  const [frozen, setFrozen] = useState(false);
+
+  const imgRef = useRef<HTMLImageElement | null>(null);
+
   // Connect to SSE and forward updates to the rest of the app via the existing event bus
   const connectSSE = () => {
     if (esRef.current) return;
@@ -92,10 +99,34 @@ const CameraPanel: React.FC<Props> = ({ onAnalyze }) => {
     setFacesCount(0);
   };
 
-  useEffect(() => () => {
-    // cleanup on unmount
-    stopBackend();
+  // Listen for a global unfreeze event from the app
+  useEffect(() => {
+    const onUnfreeze = () => { setIsFreezing(false); setFreezeCountdown(5); setFrozen(false); };
+    window.addEventListener('ui:unfreeze', onUnfreeze);
+    return () => window.removeEventListener('ui:unfreeze', onUnfreeze);
   }, []);
+
+  // cleanup on unmount
+  useEffect(() => () => { stopBackend(); }, []);
+
+  const startFreezeCountdown = () => {
+    if (!running || isFreezing || frozen) return;
+    setIsFreezing(true);
+    setFreezeCountdown(5);
+    const interval = setInterval(() => {
+      setFreezeCountdown((s) => {
+        if (s <= 1) {
+          clearInterval(interval);
+          setIsFreezing(false);
+          setFrozen(true);
+          // We could capture a snapshot here if CORS allows; for now just trigger analyze
+          onAnalyze();
+          return 0;
+        }
+        return s - 1;
+      });
+    }, 1000);
+  };
 
   return (
     <Paper elevation={0} sx={{ p: 2, borderRadius: 3, border: '1px solid #eee', height: '100%' }}>
@@ -128,19 +159,31 @@ const CameraPanel: React.FC<Props> = ({ onAnalyze }) => {
           <Typography variant="body2" color="text.secondary">
             Tip: 0 = default webcam. Increase for external cameras.
           </Typography>
+          <Box sx={{ flex: 1 }} />
+          <Button variant="contained" size="small" disabled={!running || isFreezing || frozen} onClick={startFreezeCountdown}>
+            {isFreezing ? `Capturing in ${freezeCountdown}s` : 'Capture & Freeze (5s)'}
+          </Button>
         </Stack>
 
         <Box sx={{ position: 'relative', borderRadius: 2, overflow: 'hidden', aspectRatio: '4 / 3', bgcolor: '#000' }}>
           {/* Show the exact same OpenCV camera stream from backend as MJPEG */}
-          {running ? (
+          {running && !frozen ? (
             <img
+              ref={imgRef}
               src={`${API_BASE}/api/video`}
               alt="Backend Camera"
               style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
             />
           ) : (
             <Box sx={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#bbb' }}>
-              <Typography variant="body2" align="center">Start to view backend camera stream</Typography>
+              <Typography variant="body2" align="center">{frozen ? 'Frozen' : 'Start to view backend camera stream'}</Typography>
+            </Box>
+          )}
+
+          {/* Overlay countdown */}
+          {isFreezing && (
+            <Box sx={{ position: 'absolute', inset: 0, bgcolor: 'rgba(0,0,0,0.35)', color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+              <Typography variant="h4" fontWeight={800}>{freezeCountdown}</Typography>
             </Box>
           )}
         </Box>
