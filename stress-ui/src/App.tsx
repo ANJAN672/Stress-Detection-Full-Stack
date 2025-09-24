@@ -6,12 +6,23 @@ import HistoryIcon from '@mui/icons-material/History';
 import CameraPanel from './components/CameraPanel';
 import StressPanel, { StressSummary } from './components/StressPanel';
 import HistoryPanel, { HistoryItem } from './components/HistoryPanel';
-import ReceiptPopup from './components/ReceiptPopup';
+import StressDashboard from './components/StressDashboard';
 
 function App() {
   const [summary, setSummary] = useState<StressSummary>({ level: 0.1, label: 'Low', recommendations: ['Initializing...'] });
   const [history, setHistory] = useState<HistoryItem[]>([]);
-  const [showReceipt, setShowReceipt] = useState(false);
+
+  // Popup state
+  const [dashboardOpen, setDashboardOpen] = useState(false);
+  const [countdown, setCountdown] = useState(10); // auto-cancel in 10s
+  const lastSummaryAtRef = useRef<number | null>(null);
+  const freezeHandledRef = useRef(false);
+  const countdownTimerRef = useRef<number | null>(null);
+  const monitorTimerRef = useRef<number | null>(null);
+  const dashboardOpenRef = useRef(false);
+
+  // Keep a ref of current dialog state to react to backend reset immediately
+  useEffect(() => { dashboardOpenRef.current = dashboardOpen; }, [dashboardOpen]);
 
   // Consume backend summaries
   useEffect(() => {
@@ -28,24 +39,76 @@ function App() {
             : ['Great! Keep a regular rhythm', 'Stay hydrated', 'Maintain focus with short breaks'],
         });
         setHistory(prev => [{ timestamp: new Date().toISOString(), level: d.level, label: d.label }, ...prev].slice(0, 10));
+
+        // Mark last time we received data; stream is active
+        lastSummaryAtRef.current = Date.now();
+
+        // If dialog is open and backend resumed/reset, close immediately (sync <10s)
+        if (dashboardOpenRef.current) {
+          handleCancel();
+        }
+
+        // Reset freeze flag when stream resumes
+        if (freezeHandledRef.current) freezeHandledRef.current = false;
       }
     };
     window.addEventListener('backend:summary', onSummary as EventListener);
     return () => window.removeEventListener('backend:summary', onSummary as EventListener);
   }, []);
 
+  // Monitor stream; if no updates for ~5s, consider "freeze" and show dashboard once
+  useEffect(() => {
+    const FREEZE_MS = 5000; // backend capture window
+    const POLL_MS = 50;    // tight polling for minimal latency
+
+    if (monitorTimerRef.current) return;
+    monitorTimerRef.current = window.setInterval(() => {
+      const last = lastSummaryAtRef.current;
+      if (!last) return;
+      const silentMs = Date.now() - last;
+      if (silentMs >= FREEZE_MS && !freezeHandledRef.current && !dashboardOpen) {
+        freezeHandledRef.current = true; // show once per freeze
+        openDashboard();
+      }
+    }, POLL_MS);
+    return () => {
+      if (monitorTimerRef.current) {
+        clearInterval(monitorTimerRef.current);
+        monitorTimerRef.current = null;
+      }
+    };
+  }, [dashboardOpen]);
+
+  const openDashboard = () => {
+    setDashboardOpen(true);
+    setCountdown(10);
+    if (countdownTimerRef.current) clearInterval(countdownTimerRef.current);
+    countdownTimerRef.current = window.setInterval(() => {
+      setCountdown((c) => {
+        if (c <= 1) {
+          // auto-cancel
+          handleCancel();
+          return 0;
+        }
+        return c - 1;
+      });
+    }, 1000);
+  };
+
+  const handleCancel = () => {
+    if (countdownTimerRef.current) {
+      clearInterval(countdownTimerRef.current);
+      countdownTimerRef.current = null;
+    }
+    setDashboardOpen(false);
+  };
+
+  const handlePrint = () => {
+    // Trigger browser print for the dashboard content only
+    window.print();
+  };
+
   const resetHistory = () => setHistory([]);
-
-  const handleAnalyze = () => {
-    // Camera froze and analysis point reached → show receipt popup
-    setShowReceipt(true);
-  };
-
-  const handleReceiptClose = (reason: 'print' | 'cancel' | 'auto_cancel') => {
-    setShowReceipt(false);
-    // Unfreeze camera
-    window.dispatchEvent(new Event('ui:unfreeze'));
-  };
 
   return (
     <Container maxWidth="xl" sx={{ py: 3 }}>
@@ -59,7 +122,7 @@ function App() {
 
       <Grid container spacing={2}>
         <Grid item xs={12} md={6}>
-          <CameraPanel onAnalyze={handleAnalyze} />
+          <CameraPanel onAnalyze={() => {}} />
         </Grid>
 
         <Grid item xs={12} md={6}>
@@ -87,8 +150,14 @@ function App() {
         <Typography variant="caption" sx={{ display: 'block', mt: 0.5 }}>Live backend analysis ~2 FPS</Typography>
       </Box>
 
-      {/* Receipt Popup */}
-      <ReceiptPopup open={showReceipt} summary={summary} onClose={handleReceiptClose} />
+      {/* Mini printable dashboard popup */}
+      <StressDashboard
+        open={dashboardOpen}
+        onCancel={handleCancel}
+        onPrint={handlePrint}
+        countdown={countdown}
+        summary={summary}
+      />
     </Container>
   );
 }
