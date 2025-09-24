@@ -51,7 +51,7 @@ latest_level = "Low"          # textual stress level for quick access (Low|Moder
 latest_frame = None  # BGR frame updated by camera worker
 
 # Serial output state
-SERIAL_PORT = os.environ.get('SERIAL_PORT', 'COM3')
+SERIAL_PORT = os.environ.get('SERIAL_PORT', 'COM5')
 SERIAL_BAUD = int(os.environ.get('SERIAL_BAUD', '9600'))
 SERIAL_ENABLED = os.environ.get('SERIAL_ENABLED', '0').lower() in ('1', 'true', 'yes', 'on')
 _serial_handle = None
@@ -521,6 +521,25 @@ def camera_worker():
         # If paused, keep streaming frozen frame until auto-resume
         if paused:
             if now >= pause_until:
+                # Pause ended: send reset code (0) once to turn LEDs off
+                try:
+                    if _last_sent_code != 0:
+                        if SERIAL_ENABLED and serial is not None:
+                            if _serial_handle is None:
+                                _serial_handle = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
+                                time.sleep(2.0)
+                            _serial_handle.write(b"0\n")
+                            print("0 Low", flush=True)
+                        else:
+                            print("0 Low", flush=True)
+                        _last_sent_code = 0
+                except Exception:
+                    try:
+                        if _serial_handle is not None:
+                            _serial_handle.close()
+                    except Exception:
+                        pass
+                    _serial_handle = None
                 paused = False
                 last_resume_ts = now
             else:
@@ -546,21 +565,25 @@ def camera_worker():
         except Exception:
             pass
 
-        # Send serial code on change (or print when serial disabled)
+        # Send serial code on change (and print to terminal for sync/debug)
         try:
             level_text = latest_level
             code_map = {"Low": 0, "Moderate": 1, "High": 2}
             code = code_map.get(level_text, -1)
             if code != _last_sent_code:
-                if SERIAL_ENABLED and serial is not None:
-                    # lazy-open port
-                    if _serial_handle is None:
-                        _serial_handle = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
-                        time.sleep(0.1)
-                    _serial_handle.write(str(code).encode())
-                else:
-                    print(f"[CODE] {code} ({level_text})")
-                _last_sent_code = code
+                if code in (0, 1, 2):
+                    if SERIAL_ENABLED and serial is not None:
+                        # lazy-open port
+                        if _serial_handle is None:
+                            _serial_handle = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
+                            time.sleep(2.0)
+                        _serial_handle.write(f"{code}\n".encode())  # only 0/1/2 + newline
+                        # Mirror to terminal for quick sync with Arduino
+                        print(f"{code} {level_text}", flush=True)
+                    else:
+                        # Serial disabled: print to terminal
+                        print(f"{code} {level_text}", flush=True)
+                    _last_sent_code = code
         except Exception:
             # If serial fails, do not break the loop; close handle to retry next time
             try:
@@ -597,14 +620,17 @@ def camera_worker():
                     code_map = {"Low": 0, "Moderate": 1, "High": 2}
                     code = code_map.get(level_text, -1)
                     if code != _last_sent_code:
-                        if SERIAL_ENABLED and serial is not None:
-                            if _serial_handle is None:
-                                _serial_handle = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
-                                time.sleep(0.1)
-                            _serial_handle.write(str(code).encode())
-                        else:
-                            print(f"[CODE] {code} ({level_text}) [freeze]")
-                        _last_sent_code = code
+                        if code in (0, 1, 2):
+                            if SERIAL_ENABLED and serial is not None:
+                                if _serial_handle is None:
+                                    _serial_handle = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
+                                    time.sleep(2.0)
+                                _serial_handle.write(f"{code}\n".encode())
+                                # Mirror to terminal for quick sync with Arduino
+                                print(f"{code} {level_text}", flush=True)
+                            else:
+                                print(f"{code} {level_text}", flush=True)
+                            _last_sent_code = code
                 except Exception:
                     try:
                         if _serial_handle is not None:
@@ -685,6 +711,9 @@ def start_camera():
             capture_until = 0.0
             pause_until = 0.0
             last_resume_ts = time.time()
+            # Reset last sent code so first state after start always transmits
+            global _last_sent_code
+            _last_sent_code = None
             cam_thread = threading.Thread(target=camera_worker, daemon=True)
             cam_thread.start()
             return jsonify({"status": "switched" if switching else "started", "index": cam_index, "dlib_ready": _ensure_models_loaded(), "dlib_error": _dlib_error}), 200
@@ -708,6 +737,14 @@ def stop_camera():
             except Exception:
                 pass
             cap = None
+        # Close COM port so Arduino is freed
+        try:
+            global _serial_handle
+            if _serial_handle is not None:
+                _serial_handle.close()
+        except Exception:
+            pass
+        _serial_handle = None
         # Wait briefly for worker to exit
         try:
             if cam_thread is not None and cam_thread.is_alive():
