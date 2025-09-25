@@ -565,33 +565,9 @@ def camera_worker():
         except Exception:
             pass
 
-        # Send serial code on change (and print to terminal for sync/debug)
-        try:
-            level_text = latest_level
-            code_map = {"Low": 0, "Moderate": 1, "High": 2}
-            code = code_map.get(level_text, -1)
-            if code != _last_sent_code:
-                if code in (0, 1, 2):
-                    if SERIAL_ENABLED and serial is not None:
-                        # lazy-open port
-                        if _serial_handle is None:
-                            _serial_handle = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
-                            time.sleep(2.0)
-                        _serial_handle.write(f"{code}\n".encode())  # only 0/1/2 + newline
-                        # Mirror to terminal for quick sync with Arduino
-                        print(f"{code} {level_text}", flush=True)
-                    else:
-                        # Serial disabled: print to terminal
-                        print(f"{code} {level_text}", flush=True)
-                    _last_sent_code = code
-        except Exception:
-            # If serial fails, do not break the loop; close handle to retry next time
-            try:
-                if _serial_handle is not None:
-                    _serial_handle.close()
-            except Exception:
-                pass
-            _serial_handle = None
+        # Live phase: suppress serial sending (per 5s capture + 10s freeze spec)
+        # We only send at capture-end and at pause-end (reset to 0).
+        pass
 
         faces_detected = int(summary.get('faces', 0))
 

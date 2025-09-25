@@ -56,6 +56,7 @@ function App() {
     return () => window.removeEventListener('backend:summary', onSummary as EventListener);
   }, []);
 
+  // Monitor stream; only show dashboard on manual request, not automatically
   // Monitor stream; if no updates for ~5s, consider "freeze" and show dashboard once
   useEffect(() => {
     const FREEZE_MS = 5000; // backend capture window
@@ -114,9 +115,15 @@ function App() {
     <Container maxWidth="xl" sx={{ py: 3 }}>
       <Paper elevation={0} sx={{ p: 2, mb: 2, borderRadius: 3, border: '1px solid #eee' }}>
         <Stack direction="row" alignItems="center" spacing={2}>
+          <Box 
+            component="img"
+            src="/shridevi-logo.png"
+            alt="Shridevi Education"
+            sx={{ width: 60, height: 60, objectFit: 'contain' }}
+          />
           <VideocamIcon color="primary" />
-          <Typography variant="h5" fontWeight={700}>Stress Detection Dashboard</Typography>
-          <Chip label="Real-time" color="secondary" variant="outlined" size="small" sx={{ ml: 'auto' }} />
+          <Typography variant="h5" fontWeight={700}>Stress Detection using AI</Typography>
+          <Chip label="Real-time AI Analysis" color="secondary" variant="outlined" size="small" sx={{ ml: 'auto' }} />
         </Stack>
       </Paper>
 
@@ -147,7 +154,7 @@ function App() {
 
       <Box sx={{ mt: 2 }}>
         <LinearProgress variant="determinate" value={Math.min(100, summary.level * 100)} sx={{ height: 8, borderRadius: 999 }} />
-        <Typography variant="caption" sx={{ display: 'block', mt: 0.5 }}>Live backend analysis ~2 FPS</Typography>
+        <Typography variant="caption" sx={{ display: 'block', mt: 0.5 }}>Live backend analysis ~2 FPS - Reports auto-generate when paused</Typography>
       </Box>
 
       {/* Mini printable dashboard popup */}
