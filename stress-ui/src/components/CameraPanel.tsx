@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Box, Paper, Stack, Typography, Button, Alert, Chip, TextField } from '@mui/material';
+import { Box, Paper, Stack, Typography, Button, Alert, Chip } from '@mui/material';
 import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import StopIcon from '@mui/icons-material/Stop';
 
@@ -13,9 +13,12 @@ const API_BASE = 'http://localhost:8000';
 const CameraPanel: React.FC<Props> = ({ onAnalyze }) => {
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [facesCount, setFacesCount] = useState(0);
   const [camIndex, setCamIndex] = useState<number>(0);
   const esRef = useRef<EventSource | null>(null);
+
+
+
+  const imgRef = useRef<HTMLImageElement | null>(null);
 
   // Connect to SSE and forward updates to the rest of the app via the existing event bus
   const connectSSE = () => {
@@ -31,7 +34,6 @@ const CameraPanel: React.FC<Props> = ({ onAnalyze }) => {
       try {
         const d = JSON.parse(e.data) as { level: number; label: 'Low'|'Moderate'|'High'; faces?: number };
         if (typeof d.level === 'number') {
-          setFacesCount(d.faces ?? 0);
           // Reuse existing event bus so App.tsx stays unchanged
           window.dispatchEvent(new CustomEvent('backend:summary', { detail: d }));
         }
@@ -89,20 +91,22 @@ const CameraPanel: React.FC<Props> = ({ onAnalyze }) => {
     } catch {}
     setRunning(false);
     disconnectSSE();
-    setFacesCount(0);
   };
 
-  useEffect(() => () => {
-    // cleanup on unmount
-    stopBackend();
-  }, []);
+  // cleanup on unmount
+  useEffect(() => () => { stopBackend(); }, []);
 
   return (
     <Paper elevation={0} sx={{ p: 2, borderRadius: 3, border: '1px solid #eee', height: '100%' }}>
       <Stack spacing={1}>
         <Stack direction="row" alignItems="center" spacing={1}>
-          <Typography variant="h6" fontWeight={700}>Backend Camera</Typography>
-          <Chip size="small" label={`${facesCount} face${facesCount === 1 ? '' : 's'}`} />
+          <Box 
+            component="img"
+            src="/shridevi-logo.png"
+            alt="Shridevi Education"
+            sx={{ width: 24, height: 24, objectFit: 'contain' }}
+          />
+          <Typography variant="h6" fontWeight={700}>AI Camera Analysis</Typography>
           <Chip size="small" color={running ? 'success' : 'default'} label={running ? 'Running' : 'Stopped'} />
           <Box sx={{ flex: 1 }} />
           {!running ? (
@@ -113,18 +117,24 @@ const CameraPanel: React.FC<Props> = ({ onAnalyze }) => {
         </Stack>
         {error && <Alert severity="error">{error}</Alert>}
 
-        <Stack direction="row" spacing={1} alignItems="center">
+        <Stack direction="row" spacing={2} alignItems="center">
           <Button variant="outlined" size="small" onClick={() => switchCamera(0)}>Laptop Cam</Button>
           <Button variant="outlined" size="small" onClick={() => switchCamera(1)}>USB Cam</Button>
+          <Typography variant="body2" color="text.secondary">
+            Tip: Use the buttons to switch between cameras.
+          </Typography>
+          <Box sx={{ flex: 1 }} />
         </Stack>
 
         <Box sx={{ position: 'relative', borderRadius: 2, overflow: 'hidden', aspectRatio: '4 / 3', bgcolor: '#000' }}>
           {/* Show the exact same OpenCV camera stream from backend as MJPEG */}
           {running ? (
-            <img
+            <Box
+              component="img"
+              ref={imgRef}
               src={`${API_BASE}/api/video`}
               alt="Backend Camera"
-              style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
+              sx={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
             />
           ) : (
             <Box sx={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#bbb' }}>
